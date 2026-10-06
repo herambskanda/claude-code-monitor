@@ -6,6 +6,7 @@ Single file, Python 3.8+, standard library only (macOS, Linux, Windows, WSL).
   python3 ccm_agent.py install     copy to ~/.ccm and add the /ccm-collect slash command
   python3 ccm_agent.py collect     scan transcripts, write an export file, send it (default)
   python3 ccm_agent.py export      same as collect but never sends (prints the file path)
+  python3 ccm_agent.py share       collect and write ONE complete file to the Desktop to send by WhatsApp/email
   python3 ccm_agent.py status      show what the agent sees and what is pending
 
 What leaves this device: conversation titles, project paths, token counts, tool and MCP
@@ -666,11 +667,14 @@ def build_export(conn, full, meta, accounts, cfg_keys):
         yield d
 
 
-def write_export(records, label):
-    outbox = CCM_HOME / "outbox"
+def write_export(records, label, outdir=None, friendly=False):
+    outbox = Path(outdir) if outdir else CCM_HOME / "outbox"
     outbox.mkdir(parents=True, exist_ok=True)
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", label)[:40] or "device"
-    final = outbox / ("ccm-%s-%s-%s.ndjson.gz" % (safe, utc_stamp(), uuid.uuid4().hex[:4]))  # never collide
+    if friendly:  # human-shareable name, e.g. ccm-alice-laptop-20261006-1432.ndjson.gz
+        final = outbox / ("ccm-%s-%s.ndjson.gz" % (safe, time.strftime("%Y%m%d-%H%M")))
+    else:
+        final = outbox / ("ccm-%s-%s-%s.ndjson.gz" % (safe, utc_stamp(), uuid.uuid4().hex[:4]))  # never collide
     tmp = final.with_suffix(".tmp")
     n = 0
     with gzip.open(str(tmp), "wb") as gz:
@@ -757,7 +761,25 @@ class Lock:
 
 # --------------------------------------------------------------------------- commands
 
-def collect(args, send):
+def share_dir():
+    d = Path.home() / "Desktop"
+    return d if d.is_dir() else Path.home()
+
+
+def reveal(path):
+    """Show the file in the OS file manager so a non-technical person can find it. Best effort."""
+    if os.environ.get("CCM_NO_REVEAL"):
+        return
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(path)])
+        elif os.name == "nt":
+            subprocess.Popen(["explorer", "/select,", str(path)])
+    except OSError:
+        pass
+
+
+def collect(args, send, share=False):
     cfg = load_config()
     if args.label:
         cfg["label"] = args.label
@@ -798,8 +820,20 @@ def collect(args, send):
         n_dirty = conn.execute("SELECT (SELECT count(*) FROM sessions WHERE dirty=1)"
                                "+(SELECT count(*) FROM calls WHERE dirty=1)"
                                "+(SELECT count(*) FROM util WHERE dirty=1)").fetchone()[0]
-        out_file, n_rec = None, 0
-        if n_dirty or args.full:
+        out_file, n_rec, share_file = None, 0, None
+        if share:
+            # complete snapshot of the archive: idempotent on the server, so sending only the newest file is enough
+            share_file, n_rec = write_export(build_export(conn, True, meta, accounts, [tilde(d) for d in dirs]),
+                                             meta["label"], outdir=share_dir(), friendly=True)
+            with conn:
+                conn.execute("UPDATE sessions SET dirty=0")
+                conn.execute("UPDATE calls SET dirty=0")
+                conn.execute("UPDATE util SET dirty=0")
+            if not cfg.get("servers"):  # superseded by the full snapshot
+                (CCM_HOME / "sent").mkdir(parents=True, exist_ok=True)
+                for old in (CCM_HOME / "outbox").glob("*.ndjson.gz"):
+                    os.replace(str(old), str(CCM_HOME / "sent" / old.name))
+        elif n_dirty or args.full:
             out_file, n_rec = write_export(build_export(conn, args.full, meta, accounts, [tilde(d) for d in dirs]),
                                            meta["label"])
             with conn:
@@ -816,6 +850,13 @@ def collect(args, send):
         a = accounts[tilde(d)]
         print("  %s -> %s" % (tilde(d), ("%s (%s)" % (a["email"], a.get("org_type"))) if a else "account unknown"))
     print("archive: %d conversations, %d API calls" % (tot_s, tot_c))
+    if share_file:
+        print("")
+        print("SHARE FILE: %s (%.1f MB)" % (share_file, share_file.stat().st_size / 1e6))
+        print("Send this one file to Heramb (WhatsApp / email). It has titles, project names, token counts, tool "
+              "names, times and account email; no prompt text or file contents.")
+        reveal(share_file)
+        send = False
     if out_file:
         print("export: %s (%d records, %.1f KB)" % (out_file, n_rec, out_file.stat().st_size / 1024))
     else:
@@ -831,12 +872,12 @@ def collect(args, send):
     return 0
 
 
-def command_text(python, target):
+def command_text(python, target, verb="collect"):
     return ('---\ndescription: Collect Claude Code usage stats on this device and send them to the CCM server\n'
             'allowed-tools: Bash\ndisable-model-invocation: true\n---\n'
             'Run this command with the Bash tool and show its output as-is. It only reads local Claude Code '
             'usage metadata (no prompt text leaves this device):\n\n'
-            '`"%s" "%s" collect`\n' % (python, target))
+            '`"%s" "%s" %s`\n' % (python, target, verb))
 
 
 def repo_server_urls():
@@ -888,7 +929,8 @@ def cmd_install(args):
     for d in dirs:
         cdir = d / "commands"
         cdir.mkdir(parents=True, exist_ok=True)
-        (cdir / "ccm-collect.md").write_text(command_text(sys.executable, target), encoding="utf-8")
+        (cdir / "ccm-collect.md").write_text(
+            command_text(sys.executable, target, "collect" if cfg.get("servers") else "share"), encoding="utf-8")
     print("Installed agent to %s (device %s, label '%s')" % (target, device_id(), cfg["label"]))
     print("Servers: %s" % (", ".join(cfg.get("servers") or []) or "none configured (use export + manual import)"))
     print("Slash command /ccm-collect added to: %s" % (", ".join(tilde(d) for d in dirs) or "no config dir found"))
@@ -967,6 +1009,10 @@ def main(argv=None):
             p.add_argument("--no-send", action="store_true")
             p.add_argument("--server", action="append", help="override server URL(s)")
             p.add_argument("--token")
+    p = sub.add_parser("share", help="collect and write ONE file to the Desktop to send by WhatsApp/email")
+    common(p)
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--full", action="store_true")
     p = sub.add_parser("install")
     common(p)
     p.add_argument("--server", action="append")
@@ -987,6 +1033,8 @@ def main(argv=None):
         return cmd_status(args)
     if cmd == "export":
         return collect(args, send=False)
+    if cmd == "share":
+        return collect(args, send=False, share=True)
     return collect(args, send=not args.no_send)
 
 

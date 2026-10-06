@@ -279,6 +279,25 @@ class TestParsing(AgentBase):
         cfg = json.loads((ccm_agent.CCM_HOME / "config.json").read_text())
         self.assertEqual((cfg["label"], cfg["servers"], cfg["token"]), ("box1", ["http://x:1"], "tok"))
 
+    def test_share_writes_one_full_file(self):
+        os.environ["CCM_NO_REVEAL"] = "1"
+        self.addCleanup(os.environ.pop, "CCM_NO_REVEAL", None)
+        sid = self.make_session()
+        (self.home / "Desktop").mkdir()
+        rc, out = self.run_agent("share", "--quiet", "--label", "alice-laptop")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("SHARE FILE", out)
+        files = list((self.home / "Desktop").glob("ccm-alice-laptop-*.ndjson.gz"))
+        self.assertEqual(len(files), 1)
+        n1 = sum(1 for r in self.read_export(files[0]) if r["rec"] == "call")
+        # a later share is again complete (not just the delta), so the newest file alone is enough
+        append_jsonl(self.cfg / "projects" / "-work-proj" / (sid + ".jsonl"),
+                     [assistant(sid, "msg_N", 9, [], usage(out=5))])
+        self.run_agent("share", "--quiet", "--label", "alice-laptop")
+        newest = max((self.home / "Desktop").glob("ccm-alice-laptop-*.ndjson.gz"), key=lambda f: f.stat().st_mtime_ns)
+        self.assertEqual(sum(1 for r in self.read_export(newest) if r["rec"] == "call"), n1 + 1)
+        self.assertEqual(len(list((ccm_agent.CCM_HOME / "outbox").glob("*.gz"))), 0)
+
     def test_rewritten_file_reparse_is_idempotent(self):
         sid = self.make_session()
         self.run_agent("export", "--quiet")

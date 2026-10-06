@@ -12,37 +12,31 @@ server/ccm_calc.py    cost per call, 5h / weekly windows, capacity calibration, 
 tests/                python3 -m unittest discover -s tests
 ```
 
-## Setup (once)
+## Setup (once per device) - no accounts, no network setup
 
-**Main PC.** Install Tailscale, sign in, then:
+On each device, in any folder, open Claude Code and say:
+
+> Clone https://github.com/herambskanda/claude-code-monitor, read its CLAUDE.md and set it up for heramb.
+
+Claude installs the agent (`~/.ccm`, plus a `/ccm-collect` slash command in every Claude config dir) and writes **one
+file** (`ccm-<device>-<date>.ndjson.gz`, a few MB) to the Desktop. Send that file to the main PC by WhatsApp, email, USB,
+whatever. Whenever you want fresh data, type `/ccm-collect` on that device and send the new file. Each file is a complete
+snapshot, so only the newest one per device is needed, and importing the same file twice is harmless.
+Manual equivalent: `python3 agent/ccm_agent.py install --label my-laptop` then `python3 agent/ccm_agent.py share`
+(Windows: `py -3`).
+
+**Main PC:** save the received files in one folder and import them:
 ```
-python3 server/ccm_server.py serve --port 8787     # uploads from Tailscale addresses need no token
-echo "http://<this-pc-tailscale-ip>:8787" > SERVER_URL   # commit + push so devices can find the server
+python3 server/ccm_server.py import ~/Downloads/ccm-*.ndjson.gz
+python3 server/ccm_server.py dashboard --open
 ```
-By default only Tailscale (`100.64.0.0/10`) and loopback may upload without a token. Use `--allow 192.168.0.0/16` to also
-allow your LAN, or `--require-token` to demand the bearer token (printed at start) from everyone.
 
-**Each device.** Put Tailscale on it (same tailnet), clone this repo, open Claude Code in it and say
-*"check readme and set it up for heramb"*. Claude follows [CLAUDE.md](CLAUDE.md): it installs the agent, adds the
-`/ccm-collect` slash command to every Claude config dir (`~/.claude`, `~/.claude-*`, `$CLAUDE_CONFIG_DIR`), schedules a run
-every 2 hours (cron / Task Scheduler) and does the first upload. Manual equivalent:
-`python3 agent/ccm_agent.py install --schedule --label my-laptop` (Windows: `py -3`).
-
-**Without Tailscale or a published SERVER_URL:** `python3 server/ccm_server.py bundle --server http://host:8787` writes
-`dist/ccm_agent.py` with the URL and token baked in (private: it contains the token). Or use the file route below.
-
-## Daily use
-
-On any device type `/ccm-collect` in Claude Code (or `python3 ~/.ccm/ccm_agent.py`). It reads new transcript data
-only (a repeat run takes about a second), writes `~/.ccm/outbox/ccm-<device>-<time>.ndjson.gz` and POSTs it to the first
-reachable server. If your PC is off the file stays in `outbox/` and goes out on the next run, so nothing is lost.
-
-No network path? `python3 ccm_agent.py export` prints the file path; copy it any way you like and run
-`python3 server/ccm_server.py import <files or folder>` on the main PC. Imports are idempotent.
-
-Devices on different networks need *some* route to the main PC. Same LAN (Proxmox VMs): nothing to do. Remote devices:
-a private mesh such as Tailscale (peer to peer, no hosting) or self-hosted WireGuard/Headscale. The token travels in
-clear over plain HTTP, so use it over LAN or a VPN only.
+### Optional: automatic upload over a private network
+If you ever want devices to push on a schedule: run `python3 server/ccm_server.py serve` on the main PC, put the
+Tailscale (or LAN) URL in `SERVER_URL`, and have each device `install --schedule`. By default only Tailscale
+(`100.64.0.0/10`) and loopback may upload without a token; `--allow CIDR` adds networks and `--require-token` demands the
+bearer token. `server/ccm_server.py bundle --server URL` writes `dist/ccm_agent.py` with URL and token baked in
+(private: it contains the token). This needs Tailscale (or similar) signed in on every device, so it is not the default.
 
 ## On the main PC
 
