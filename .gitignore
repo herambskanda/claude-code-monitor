@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+dist/
+server/data/
+*.sqlite
+*.ndjson.gz
+.DS_Store

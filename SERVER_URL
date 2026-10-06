@@ -1,0 +1,3 @@
+# One server URL per line (lines starting with # are ignored). Use the Tailscale address of the main PC, e.g.
+# http://100.101.102.103:8787 or http://my-pc.tailXXXX.ts.net:8787
+# Not published yet.
