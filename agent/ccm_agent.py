@@ -6,6 +6,8 @@ Single file, Python 3.8+, standard library only (macOS, Linux, Windows, WSL).
   python3 ccm_agent.py install     copy to ~/.ccm and add the /ccm-collect slash command
   python3 ccm_agent.py collect     scan transcripts, write an export file, send it (default)
   python3 ccm_agent.py export      same as collect but never sends (prints the file path)
+  python3 ccm_agent.py upload      collect, encrypt and push to the private GitHub data repo now
+  python3 ccm_agent.py poll        (scheduled) upload when the main PC has requested data
   python3 ccm_agent.py share       collect and write ONE complete file to the Desktop to send by WhatsApp/email
   python3 ccm_agent.py status      show what the agent sees and what is pending
 
@@ -15,8 +17,11 @@ a 60-char fallback label when a conversation has no title), no file contents, no
 inputs, no credentials.
 """
 import argparse
+import base64
 import calendar
 import gzip
+import hashlib
+import hmac
 import json
 import os
 import platform
@@ -40,6 +45,9 @@ GAP_ACTIVE_S = 300  # gaps shorter than this count as active time
 BAKED_CONFIG = {}
 # <<< CCM-BAKED-CONFIG
 
+GITHUB_API = os.environ.get("CCM_GITHUB_API", "https://api.github.com")
+POLL_MINUTES = 10
+
 CCM_HOME = Path(os.environ.get("CCM_HOME") or (Path.home() / ".ccm"))
 
 _TS_RE = re.compile(r"(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(?:\.(\d+))?")
@@ -60,6 +68,9 @@ def utc_stamp():
 
 def utc_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+RESULT = {}  # side-channel from collect() for the upload path
 
 
 def log(msg):
@@ -726,6 +737,246 @@ def send_outbox(cfg):
     return delivered, pending, last_err
 
 
+
+# --------------------------------------------------------------------------- encryption (stdlib only)
+# Encrypt-then-MAC: key from the passphrase via scrypt (PBKDF2 fallback), HMAC-SHA256 in counter mode as the
+# keystream, HMAC-SHA256 over header+ciphertext as the tag. Built only from standard-library primitives because
+# Python ships no cipher. The private repo + token are the primary protection; this is a second layer.
+
+ENC_MAGIC = b"CCMENC1"
+
+
+def _derive_keys(passphrase, salt, kdf_id):
+    pw = passphrase.encode("utf-8")
+    if kdf_id == 1:
+        key = hashlib.scrypt(pw, salt=salt, n=2 ** 14, r=8, p=1, dklen=64)
+    elif kdf_id == 2:
+        key = hashlib.pbkdf2_hmac("sha256", pw, salt, 200000, 64)
+    else:
+        raise ValueError("unknown key derivation")
+    return key[:32], key[32:]
+
+
+def _keystream(key, nonce, n):
+    blocks = (hmac.new(key, nonce + i.to_bytes(8, "big"), hashlib.sha256).digest() for i in range((n + 31) // 32))
+    return b"".join(blocks)[:n]
+
+
+def _xor(a, b):
+    n = len(a)
+    return (int.from_bytes(a, "big") ^ int.from_bytes(b, "big")).to_bytes(n, "big") if n else b""
+
+
+def encrypt_bytes(data, passphrase):
+    salt, nonce = os.urandom(16), os.urandom(16)
+    kdf_id = 1 if hasattr(hashlib, "scrypt") else 2
+    try:
+        ek, mk = _derive_keys(passphrase, salt, kdf_id)
+    except (ValueError, MemoryError, AttributeError):
+        kdf_id = 2
+        ek, mk = _derive_keys(passphrase, salt, kdf_id)
+    header = ENC_MAGIC + bytes([kdf_id]) + salt + nonce
+    ct = _xor(data, _keystream(ek, nonce, len(data)))
+    return header + ct + hmac.new(mk, header + ct, hashlib.sha256).digest()
+
+
+def decrypt_bytes(blob, passphrase):
+    hl = len(ENC_MAGIC) + 1 + 32
+    if len(blob) < hl + 32 or blob[:len(ENC_MAGIC)] != ENC_MAGIC:
+        raise ValueError("not a CCM encrypted file")
+    kdf_id, salt, nonce = blob[len(ENC_MAGIC)], blob[len(ENC_MAGIC) + 1:len(ENC_MAGIC) + 17], blob[len(ENC_MAGIC) + 17:hl]
+    ek, mk = _derive_keys(passphrase, salt, kdf_id)
+    header, ct, tag = blob[:hl], blob[hl:-32], blob[-32:]
+    if not hmac.compare_digest(tag, hmac.new(mk, header + ct, hashlib.sha256).digest()):
+        raise ValueError("wrong passphrase or corrupted file")
+    return _xor(ct, _keystream(ek, nonce, len(ct)))
+
+
+# --------------------------------------------------------------------------- join code + GitHub transport
+
+def make_join_code(repo, token, passphrase):
+    raw = json.dumps({"r": repo, "t": token, "p": passphrase}, separators=(",", ":")).encode("utf-8")
+    return "ccm1." + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def parse_join_code(code):
+    code = code.strip()
+    if not code.startswith("ccm1."):
+        raise ValueError("not a CCM join code (should start with 'ccm1.')")
+    body = code[5:]
+    try:
+        d = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8"))
+        return {"repo": d["r"], "token": d["t"], "passphrase": d["p"]}
+    except (ValueError, KeyError, TypeError):
+        raise ValueError("join code is damaged (copy it again, all of it)")
+
+
+class GhError(Exception):
+    def __init__(self, status, msg):
+        Exception.__init__(self, "GitHub %s: %s" % (status, msg))
+        self.status = status
+
+
+def gh_api(method, path, token, body=None, etag=None, timeout=90):
+    """Minimal GitHub REST call. Uses only the given token (never local git/gh credentials)."""
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urlrequest.Request(GITHUB_API + path, data=data, method=method)
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    req.add_header("User-Agent", "ccm-agent/" + AGENT_VERSION)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    if etag:
+        req.add_header("If-None-Match", etag)
+    last = None
+    for attempt in range(4):  # transient network errors and 5xx are retried with backoff
+        try:
+            with urlrequest.urlopen(req, timeout=timeout) as r:
+                raw = r.read()
+                return r.status, (json.loads(raw.decode("utf-8")) if raw else None), r.headers
+        except urlerror.HTTPError as e:
+            if e.code == 304:
+                return 304, None, e.headers
+            try:
+                msg = json.loads(e.read().decode("utf-8")).get("message", "")
+            except (ValueError, OSError):
+                msg = ""
+            if e.code < 500:
+                raise GhError(e.code, msg or e.reason)
+            last = GhError(e.code, msg or e.reason)
+        except (urlerror.URLError, OSError) as e:
+            last = e
+        time.sleep(1.5 * (attempt + 1) if not os.environ.get("CCM_NO_SLEEP") else 0)
+    raise last
+
+
+def device_branch(meta):
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", meta["label"]).strip("-")[:30] or "device"
+    return "device/%s-%s" % (safe, meta["device_id"][:8])
+
+
+def gh_upload(gh, branch, payload, meta):
+    """Push `payload` (already encrypted) as a single parentless commit, force-updating the device branch,
+    so the repo never accumulates history."""
+    repo, tok = gh["repo"], gh["token"]
+    b = gh_api("POST", "/repos/%s/git/blobs" % repo, tok,
+               {"content": base64.b64encode(payload).decode("ascii"), "encoding": "base64"})[1]
+    m = gh_api("POST", "/repos/%s/git/blobs" % repo, tok,
+               {"content": json.dumps(meta, indent=1), "encoding": "utf-8"})[1]
+    t = gh_api("POST", "/repos/%s/git/trees" % repo, tok, {"tree": [
+        {"path": "data.ccm", "mode": "100644", "type": "blob", "sha": b["sha"]},
+        {"path": "meta.json", "mode": "100644", "type": "blob", "sha": m["sha"]}]})[1]
+    c = gh_api("POST", "/repos/%s/git/commits" % repo, tok,
+               {"message": "ccm upload from %s" % meta["label"], "tree": t["sha"], "parents": []})[1]
+    try:
+        gh_api("PATCH", "/repos/%s/git/refs/heads/%s" % (repo, branch), tok, {"sha": c["sha"], "force": True})
+    except GhError as e:
+        if e.status not in (404, 422):
+            raise
+        gh_api("POST", "/repos/%s/git/refs" % repo, tok, {"ref": "refs/heads/" + branch, "sha": c["sha"]})
+    return c["sha"]
+
+
+def gh_state_path():
+    return CCM_HOME / "gh_state.json"
+
+
+def load_gh_state():
+    return read_json(gh_state_path())
+
+
+def save_gh_state(st):
+    CCM_HOME.mkdir(parents=True, exist_ok=True)
+    with open(str(gh_state_path()), "w", encoding="utf-8") as f:
+        json.dump(st, f)
+
+
+def request_targets_me(req, label, dev_id):
+    d = req.get("devices", "*")
+    if d in (None, "*", ["*"]):
+        return True
+    d = [d] if isinstance(d, str) else d
+    return label in d or dev_id in d or dev_id[:8] in d
+
+
+def do_upload(args, cfg, handled_id=None):
+    """Collect everything (full snapshot), encrypt, push to the device branch. Returns True on success."""
+    gh = cfg.get("github")
+    RESULT.clear()
+    rc = collect(args, send=False, upload=True)
+    f = RESULT.get("upload_file")
+    if rc != 0 or not f:
+        print("upload: nothing to upload (no Claude Code data found)")
+        return False
+    meta = RESULT["meta"]
+    try:
+        plain = Path(f).read_bytes()
+        info = {"device_id": meta["device_id"], "label": meta["label"], "os": meta["os"],
+                "agent_version": AGENT_VERSION, "uploaded_at": utc_iso(), "handled_request": handled_id,
+                "bytes": len(plain)}
+        gh_upload(gh, device_branch(meta), encrypt_bytes(plain, gh["passphrase"]), info)
+    except (GhError, urlerror.URLError, OSError) as e:
+        print("upload FAILED: %s (will retry on the next poll)" % getattr(e, "reason", e))
+        return False
+    finally:
+        try:
+            Path(f).unlink()
+        except OSError:
+            pass
+    st = load_gh_state()
+    st["last_upload"] = time.time()
+    if handled_id:
+        st["handled_id"] = max(handled_id, st.get("handled_id", 0))
+    save_gh_state(st)
+    print("upload: ok, encrypted snapshot pushed to branch %s of %s" % (device_branch(meta), gh["repo"]))
+    return True
+
+
+def cmd_upload(args):
+    cfg = load_config()
+    if not cfg.get("github"):
+        print("no GitHub join code configured; use `install --join CODE` or `share`")
+        return 1
+    return 0 if do_upload(args, cfg) else 1
+
+
+def cmd_poll(args):
+    """Scheduled every few minutes: check requests.json in the data repo and upload when asked (or when
+    auto_hours elapsed). One conditional request per poll (304 when unchanged)."""
+    cfg = load_config()
+    gh = cfg.get("github")
+    if not gh:
+        return 0
+    st = load_gh_state()
+    try:
+        status, body, hdr = gh_api("GET", "/repos/%s/contents/requests.json" % gh["repo"], gh["token"],
+                                   etag=st.get("etag"), timeout=30)
+    except (GhError, urlerror.URLError, OSError) as e:
+        if not args.quiet:
+            print("poll: cannot reach GitHub (%s)" % getattr(e, "reason", e))
+        return 0
+    if status == 200:
+        try:
+            st["req"] = json.loads(base64.b64decode(body["content"]).decode("utf-8"))
+        except (ValueError, KeyError):
+            st["req"] = {}
+        st["etag"] = hdr.get("ETag")
+        save_gh_state(st)
+    req = st.get("req") or {}
+    meta_label = cfg.get("label") or socket.gethostname()
+    did = device_id()
+    due = bool(req.get("id", 0) > st.get("handled_id", 0) and request_targets_me(req, meta_label, did))
+    auto = float(req.get("auto_hours") or 0)
+    if not due and auto and time.time() - st.get("last_upload", 0) > auto * 3600:
+        due = True
+    if not due and not args.force:
+        if not args.quiet:
+            print("poll: no new request")
+        return 0
+    return 0 if do_upload(args, cfg, handled_id=req.get("id") if due else None) else 1
+
+
 # --------------------------------------------------------------------------- locking
 
 class Lock:
@@ -779,7 +1030,7 @@ def reveal(path):
         pass
 
 
-def collect(args, send, share=False):
+def collect(args, send, share=False, upload=False):
     cfg = load_config()
     if args.label:
         cfg["label"] = args.label
@@ -833,6 +1084,15 @@ def collect(args, send, share=False):
                 (CCM_HOME / "sent").mkdir(parents=True, exist_ok=True)
                 for old in (CCM_HOME / "outbox").glob("*.ndjson.gz"):
                     os.replace(str(old), str(CCM_HOME / "sent" / old.name))
+        elif upload:
+            tmp_dir = CCM_HOME / "tmp"
+            out_file, n_rec = write_export(build_export(conn, True, meta, accounts, [tilde(d) for d in dirs]),
+                                           meta["label"], outdir=tmp_dir)
+            RESULT["upload_file"], RESULT["meta"] = out_file, meta
+            with conn:
+                conn.execute("UPDATE sessions SET dirty=0")
+                conn.execute("UPDATE calls SET dirty=0")
+                conn.execute("UPDATE util SET dirty=0")
         elif n_dirty or args.full:
             out_file, n_rec = write_export(build_export(conn, args.full, meta, accounts, [tilde(d) for d in dirs]),
                                            meta["label"])
@@ -857,9 +1117,11 @@ def collect(args, send, share=False):
               "names, times and account email; no prompt text or file contents.")
         reveal(share_file)
         send = False
-    if out_file:
+    if out_file and upload:
+        pass
+    elif out_file:
         print("export: %s (%d records, %.1f KB)" % (out_file, n_rec, out_file.stat().st_size / 1024))
-    else:
+    elif not upload:
         print("export: no new data since the last run")
     if send:
         delivered, pending, err = send_outbox(cfg)
@@ -867,7 +1129,7 @@ def collect(args, send, share=False):
             print("sent: %d file(s) delivered to the CCM server" % delivered)
         if pending:
             print("pending: %d file(s) in %s (%s)" % (pending, CCM_HOME / "outbox", err or "will retry next run"))
-    elif out_file:
+    elif out_file and not upload:
         print("not sent (export mode). Import it on the main PC with: ccm_server.py import %s" % out_file)
     return 0
 
@@ -924,37 +1186,56 @@ def cmd_install(args):
         cfg["servers"] = repo_server_urls()
     if args.token:
         cfg["token"] = args.token
+    if args.join:
+        try:
+            cfg["github"] = parse_join_code(args.join)
+        except ValueError as e:
+            print("ERROR: %s" % e)
+            return 2
     save_config(cfg)
     dirs = discover_config_dirs(args.config_dir)
     for d in dirs:
         cdir = d / "commands"
         cdir.mkdir(parents=True, exist_ok=True)
         (cdir / "ccm-collect.md").write_text(
-            command_text(sys.executable, target, "collect" if cfg.get("servers") else "share"), encoding="utf-8")
+            command_text(sys.executable, target, "upload" if cfg.get("github") else
+                         ("collect" if cfg.get("servers") else "share")), encoding="utf-8")
     print("Installed agent to %s (device %s, label '%s')" % (target, device_id(), cfg["label"]))
     print("Servers: %s" % (", ".join(cfg.get("servers") or []) or "none configured (use export + manual import)"))
     print("Slash command /ccm-collect added to: %s" % (", ".join(tilde(d) for d in dirs) or "no config dir found"))
-    if args.schedule:
-        install_schedule(target, args.schedule_hours)
+    if args.schedule or (cfg.get("github") and not args.no_schedule):
+        install_schedule(target, args.schedule_hours, poll=bool(cfg.get("github")))
+    if cfg.get("github"):
+        print("GitHub transport: repo %s (encrypted uploads, checked every %d min)" % (cfg["github"]["repo"],
+                                                                                    POLL_MINUTES))
+        ok = False
+        if not args.no_upload:
+            args.quiet = True
+            args.full = True
+            ok = cmd_upload(args) == 0
+        print("first upload: %s" % ("done" if ok else "not done (check the internet connection; it retries "
+                                                     "automatically every %d min)" % POLL_MINUTES))
     reachable = check_servers(cfg.get("servers") or [])
     if cfg.get("servers") and not reachable:
         print("WARNING: no server reachable. Is Tailscale installed, signed in and connected on this device? "
               "Data will queue in %s until the server is reachable." % (CCM_HOME / "outbox"))
-    print('Run now: "%s" "%s" collect' % (sys.executable, target))
+    print('Run now: "%s" "%s" %s' % (sys.executable, target, "upload" if cfg.get("github") else "share"))
     return 0
 
 
-def install_schedule(target, hours):
-    cmd = '"%s" "%s" collect --quiet' % (sys.executable, target)
+def install_schedule(target, hours, poll=False):
+    cmd = '"%s" "%s" %s --quiet' % (sys.executable, target, "poll" if poll else "collect")
     if os.name == "nt":
         try:
-            r = subprocess.run(["schtasks", "/Create", "/F", "/SC", "HOURLY", "/MO", str(hours), "/TN",
-                                "CCM-Collect", "/TR", cmd], capture_output=True, text=True)
+            sched = ["/SC", "MINUTE", "/MO", str(POLL_MINUTES)] if poll else ["/SC", "HOURLY", "/MO", str(hours)]
+            r = subprocess.run(["schtasks", "/Create", "/F"] + sched + ["/TN", "CCM-Collect", "/TR", cmd],
+                               capture_output=True, text=True)
             print("Scheduled task CCM-Collect: %s" % ("ok" if r.returncode == 0 else r.stderr.strip()))
         except OSError as e:
             print("could not schedule: %s" % e)
         return
-    line = "7 */%d * * * %s >/dev/null 2>&1  # ccm-agent" % (hours, cmd)
+    when = "*/%d * * * *" % POLL_MINUTES if poll else "7 */%d * * *" % hours
+    line = "%s %s >/dev/null 2>&1  # ccm-agent" % (when, cmd)
     try:
         cur = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
     except OSError:
@@ -963,7 +1244,7 @@ def install_schedule(target, hours):
     existing = [l for l in (cur.stdout if cur.returncode == 0 else "").splitlines() if "# ccm-agent" not in l]
     r = subprocess.run(["crontab", "-"], input="\n".join(existing + [line]) + "\n", text=True,
                        capture_output=True)
-    print("cron entry (every %dh): %s" % (hours, "ok" if r.returncode == 0 else r.stderr.strip()))
+    print("cron entry (%s): %s" % (when, "ok" if r.returncode == 0 else r.stderr.strip()))
 
 
 def cmd_status(args):
@@ -1013,8 +1294,19 @@ def main(argv=None):
     common(p)
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--full", action="store_true")
+    for name in ("upload", "poll"):
+        p = sub.add_parser(name, help="GitHub transport: %s" % ("collect + encrypt + push now" if name == "upload"
+                                                              else "check for a data request (scheduled)"))
+        common(p)
+        p.add_argument("--quiet", action="store_true")
+        p.add_argument("--full", action="store_true")
+        if name == "poll":
+            p.add_argument("--force", action="store_true", help="upload even if nobody asked")
     p = sub.add_parser("install")
     common(p)
+    p.add_argument("--join", help="join code from the main PC (ccm1....)")
+    p.add_argument("--no-upload", action="store_true")
+    p.add_argument("--no-schedule", action="store_true")
     p.add_argument("--server", action="append")
     p.add_argument("--token")
     p.add_argument("--schedule", action="store_true", help="also schedule periodic runs (cron / Task Scheduler)")
@@ -1035,6 +1327,10 @@ def main(argv=None):
         return collect(args, send=False)
     if cmd == "share":
         return collect(args, send=False, share=True)
+    if cmd == "upload":
+        return cmd_upload(args)
+    if cmd == "poll":
+        return cmd_poll(args)
     return collect(args, send=not args.no_send)
 
 

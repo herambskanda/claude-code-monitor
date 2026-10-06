@@ -10,20 +10,27 @@ anything outside this repo, `~/.ccm`, and the Claude `commands/` folders.
 
 ## Steps (use `py -3` instead of `python3` on Windows)
 
+The user's message may contain a **join code** (a long string starting with `ccm1.`). If it does, use mode A, otherwise mode B.
+
 1. **Python 3.8+.** Run `python3 --version`. If missing: Windows `winget install -e --id Python.Python.3.12` (then use
    `py -3`); Debian/Ubuntu `sudo apt-get install -y python3`; macOS `xcode-select --install` or `brew install python`.
-2. **Install the agent:** `python3 agent/ccm_agent.py install --label "<short name of this device>"`
-   Use the hostname or something descriptive like "alice-laptop". This copies the agent to `~/.ccm` and adds a
-   `/ccm-collect` slash command to every Claude config dir (so it can be re-run any time by typing `/ccm-collect`).
-3. **Collect and create the file:** `python3 agent/ccm_agent.py share`
-   Large histories can take a few minutes; that is normal. It prints `SHARE FILE: <path>` (on the Desktop, or the home
-   folder if there is no Desktop) and opens the folder where possible.
-4. **Tell the human, in 3 short lines:** what was installed, the exact path of the file, and:
-   "Send this one file to Heramb on WhatsApp (or email). Whenever he asks again, open Claude Code and type
-   `/ccm-collect`, then send the new file." Then stop. A later file is always complete, so only the newest one is needed.
+2. **Mode A, join code given (automatic uploads).** Run
+   `python3 agent/ccm_agent.py install --join "<the join code>" --label "<short name of this device>"`
+   Use the hostname or something descriptive like "alice-laptop". This installs the agent to `~/.ccm`, adds a
+   `/ccm-collect` slash command to every Claude config dir, schedules a check every 10 minutes (cron / Task Scheduler),
+   and does the first upload: an encrypted snapshot pushed to Heramb's private data repo with the token inside the join
+   code. It does not use or need the user's own GitHub login. Large histories can take a few minutes. Success is
+   `first upload: done`. If it says "not done", it is usually the internet connection and it retries by itself;
+   report that. Never print the join code back or write it anywhere except via the command above.
+3. **Mode B, no join code (manual file).** Run `python3 agent/ccm_agent.py install --label "<name>"` and then
+   `python3 agent/ccm_agent.py share`. It prints `SHARE FILE: <path>` (Desktop or home folder) and opens the folder.
+4. **Tell the human, in 3 short lines:** what was installed and the device label; for mode A that uploads now happen
+   automatically whenever Heramb requests data (nothing more to do); for mode B the exact file path and
+   "send this one file to Heramb on WhatsApp; whenever he asks again type `/ccm-collect` and send the new file".
+   Then stop.
 
 Re-running these steps is safe (idempotent).
 
 ## Optional (only if Heramb says there is a server)
-`SERVER_URL` in the repo root may list a server address. If it does, and the device can reach it, add `--schedule` to
-step 2 and use `python3 agent/ccm_agent.py collect` in step 3 to upload directly instead of making a file.
+`SERVER_URL` in the repo root may list a server address. If it does and the device can reach it, add `--schedule` to
+install and use `python3 agent/ccm_agent.py collect` instead.

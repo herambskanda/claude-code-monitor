@@ -375,6 +375,66 @@ def cmd_dashboard(a):
     return ccm_dashboard.run(data_dir(a.data), a.host, a.port, a.open)
 
 
+def _gh_token(a):
+    import getpass
+    return a.token or os.environ.get("CCM_GH_TOKEN") or getpass.getpass("GitHub token (hidden): ").strip()
+
+
+def cmd_github_init(a):
+    import ccm_gh
+    d = data_dir(a.data)
+    try:
+        code = ccm_gh.init(d, a.repo, _gh_token(a), a.passphrase)
+    except (ccm_gh.GhError, ValueError) as e:
+        print("ERROR: %s" % e)
+        return 1
+    print("GitHub transport ready for %s.\n" % a.repo)
+    print("JOIN CODE (treat like a password; send it to each helper once):\n\n%s\n" % code)
+    print("Each device: open Claude Code, then say:\n  Clone https://github.com/herambskanda/claude-code-monitor, "
+          "read its CLAUDE.md and set it up for heramb. Join code: <the code above>")
+    return 0
+
+
+def cmd_join_code(a):
+    import ccm_gh
+    code = ccm_gh.join_code(data_dir(a.data))
+    print(code or "not configured: run github-init first")
+    return 0 if code else 1
+
+
+def cmd_request(a):
+    import ccm_gh
+    try:
+        req = ccm_gh.request_collect(data_dir(a.data), a.device or None, a.auto_hours, not a.no_trigger)
+    except (ccm_gh.GhError, ValueError) as e:
+        print("ERROR: %s" % e)
+        return 1
+    print("request %s sent to %s (devices check every ~10 min; auto_hours=%s)" % (
+        req.get("id"), ", ".join(a.device) if a.device else "all devices", req.get("auto_hours")))
+    return 0
+
+
+def cmd_pull(a):
+    import ccm_gh
+    d = data_dir(a.data)
+    while True:
+        conn = open_db(d)
+        try:
+            res = ccm_gh.pull_all(d, conn)
+        except (ccm_gh.GhError, ValueError, OSError) as e:
+            print("pull failed: %s" % e)
+            res = []
+        finally:
+            conn.close()
+        for r in res:
+            if r["status"] != "unchanged":
+                print("%s: %s %s" % (r["branch"], r["status"], {k: v for k, v in r.items()
+                                                                 if k in ("sessions", "calls", "error")}))
+        if not a.watch:
+            return 0
+        time.sleep(a.watch)
+
+
 def cmd_set_capacity(a):
     conn = open_db(data_dir(a.data))
     row = conn.execute("SELECT account_uuid,email FROM accounts WHERE account_uuid=? OR email=? OR nickname=?",
@@ -413,6 +473,17 @@ def main(argv=None):
     p.add_argument("--out", help="output file (default ../dist/ccm_agent.py)")
     p = sub.add_parser("report")
     p.add_argument("--top", type=int, default=15)
+    p = sub.add_parser("github-init", help="set up the private GitHub data repo transport; prints the join code")
+    p.add_argument("--repo", required=True, help="owner/name of the PRIVATE data repo")
+    p.add_argument("--token", help="fine-grained token (or env CCM_GH_TOKEN, or prompt)")
+    p.add_argument("--passphrase", help="encryption passphrase (default: generated)")
+    sub.add_parser("join-code", help="print the join code again")
+    p = sub.add_parser("request", help="ask all (or some) devices to upload fresh data now")
+    p.add_argument("--device", action="append", help="device label (repeatable); default all")
+    p.add_argument("--auto-hours", type=float, help="devices also upload by themselves every N hours (0 = off)")
+    p.add_argument("--no-trigger", action="store_true", help="only change --auto-hours, do not request now")
+    p = sub.add_parser("pull", help="fetch new device uploads from GitHub, decrypt and import")
+    p.add_argument("--watch", type=int, metavar="SECONDS", help="keep pulling every N seconds")
     p = sub.add_parser("dashboard", help="local web dashboard (127.0.0.1 only)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8788)
@@ -427,7 +498,9 @@ def main(argv=None):
         print(get_token(data_dir(a.data)))
         return 0
     return {"serve": cmd_serve, "import": cmd_import, "bundle": cmd_bundle, "report": cmd_report,
-            "set-capacity": cmd_set_capacity, "dashboard": cmd_dashboard}[a.cmd](a)
+            "set-capacity": cmd_set_capacity, "dashboard": cmd_dashboard,
+            "github-init": cmd_github_init, "join-code": cmd_join_code, "request": cmd_request,
+            "pull": cmd_pull}[a.cmd](a)
 
 
 if __name__ == "__main__":

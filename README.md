@@ -12,24 +12,37 @@ server/ccm_calc.py    cost per call, 5h / weekly windows, capacity calibration, 
 tests/                python3 -m unittest discover -s tests
 ```
 
-## Setup (once per device) - no accounts, no network setup
+## Setup (once per device) - works with any GitHub account (or none)
 
-On each device, in any folder, open Claude Code and say:
-
-> Clone https://github.com/herambskanda/claude-code-monitor, read its CLAUDE.md and set it up for heramb.
-
-Claude installs the agent (`~/.ccm`, plus a `/ccm-collect` slash command in every Claude config dir) and writes **one
-file** (`ccm-<device>-<date>.ndjson.gz`, a few MB) to the Desktop. Send that file to the main PC by WhatsApp, email, USB,
-whatever. Whenever you want fresh data, type `/ccm-collect` on that device and send the new file. Each file is a complete
-snapshot, so only the newest one per device is needed, and importing the same file twice is harmless.
-Manual equivalent: `python3 agent/ccm_agent.py install --label my-laptop` then `python3 agent/ccm_agent.py share`
-(Windows: `py -3`).
-
-**Main PC:** save the received files in one folder and import them:
+**One-time on the main PC** (about 5 minutes): create a PRIVATE GitHub repo for the data (e.g. `claude-code-monitor-data`)
+and a fine-grained personal access token limited to that repo with *Contents: Read and write*
+(GitHub > Settings > Developer settings > Personal access tokens > Fine-grained tokens). Then:
 ```
-python3 server/ccm_server.py import ~/Downloads/ccm-*.ndjson.gz
+python3 server/ccm_server.py github-init --repo <you>/claude-code-monitor-data     # asks for the token, prints a JOIN CODE
+```
+**On each device**, in any folder, open Claude Code and say (helpers do not need a GitHub account; the join code carries
+the token and an encryption passphrase, and the agent never uses the device's own git/GitHub login):
+
+> Clone https://github.com/<you>/claude-code-monitor, read its CLAUDE.md and set it up for <name>. Join code: ccm1....
+
+Claude installs the agent (`~/.ccm`, plus a `/ccm-collect` slash command in every Claude config dir), schedules a check
+every 10 minutes and does the first upload. Each upload is a complete snapshot, encrypted on the device (scrypt +
+HMAC-SHA256 stream cipher, standard library only) and force-pushed as a single parentless commit to its own branch
+`device/<label>-<id>` of the data repo, so the repo never grows.
+
+**On demand, from the main PC:**
+```
+python3 server/ccm_server.py request                 # all devices upload within ~10 minutes (or --device NAME)
+python3 server/ccm_server.py pull                    # fetch, decrypt and import new uploads (--watch 60 to loop)
+python3 server/ccm_server.py request --auto-hours 24 --no-trigger    # optional: devices also upload daily by themselves
 python3 server/ccm_server.py dashboard --open
 ```
+Revoke access any time by deleting the token in GitHub; change the passphrase with `github-init --passphrase ...` and
+re-issue the join code. Treat the join code like a password: it grants read/write on the data repo.
+
+**No GitHub at all:** omit the join code. Claude then runs `share`, which writes ONE complete file
+(`ccm-<device>-<date>.ndjson.gz`) to the Desktop for you to send by WhatsApp/email. Import with
+`python3 server/ccm_server.py import <files or folder>`; newer files from the same device just update the older data.
 
 ### Optional: automatic upload over a private network
 If you ever want devices to push on a schedule: run `python3 server/ccm_server.py serve` on the main PC, put the
