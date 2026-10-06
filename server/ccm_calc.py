@@ -4,6 +4,7 @@ per-account capacity calibration, per-conversation share of the 5h and weekly li
 Percentages are ESTIMATES: Anthropic does not publish limits. Capacity is calibrated from the
 usage snapshots Claude Code caches (the real utilization %), see `calibrate`.
 """
+import bisect
 import calendar
 import json
 import re
@@ -149,12 +150,14 @@ def assign_windows(calls_by_acct, snaps):
         anchored = sorted(set((round(a), round(b)) for a, b in anchored))
         gstart = None
         out = []
+        starts = [a for a, _ in anchored]
         for ts, usd, dev, sid in calls:
             w5 = None
-            for a, b in anchored:
-                if a <= ts < b:
-                    w5 = (a, b)
-                    break
+            j = bisect.bisect_right(starts, ts) - 1   # first anchored window containing ts (windows are 5h long)
+            while j >= 0 and starts[j] > ts - 2 * H5:
+                if anchored[j][1] > ts:
+                    w5 = anchored[j]
+                j -= 1
             if w5 is None:
                 if gstart is None or ts >= gstart + H5:
                     gstart = ts
@@ -174,13 +177,20 @@ def calibrate(calls_by_acct, snaps, min_util=5.0):
     caps = {}
     for acct, ss in snaps.items():
         calls = calls_by_acct.get(acct, [])
+        ts_l = [c[0] for c in calls]          # calls are time-sorted: prefix sums make each window sum O(log n)
+        cum = [0.0]
+        for c in calls:
+            cum.append(cum[-1] + c[1])
+
+        def usd_between(a, b, ts_l=ts_l, cum=cum):
+            return cum[bisect.bisect_right(ts_l, b)] - cum[bisect.bisect_left(ts_l, a)]
         s5, s7 = [], []
         for s in ss:
             f = s["fetched_s"]
             w5 = _win(s, "five_hour")
             if w5 and w5[0] >= min_util and f <= w5[1] + 60:
                 a, b = w5[1] - H5, w5[1]
-                usd = sum(c[1] for c in calls if a <= c[0] <= min(b, f))
+                usd = usd_between(a, min(b, f))
                 if usd > 0:
                     s5.append(usd / (w5[0] / 100.0))
             w7 = _win(s, "seven_day")
@@ -190,7 +200,7 @@ def calibrate(calls_by_acct, snaps, min_util=5.0):
                 rows = (s.get("breakdown") or {}).get("rows") or {}
                 if rows.get("claude_code") is not None:
                     share = max(float(rows["claude_code"]), 1.0) / 100.0
-                usd = sum(c[1] for c in calls if a <= c[0] <= min(b, f))
+                usd = usd_between(a, min(b, f))
                 if usd > 0:
                     s7.append(usd / ((w7[0] / 100.0) * share))
         caps[acct] = {

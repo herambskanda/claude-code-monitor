@@ -377,7 +377,14 @@ def cmd_dashboard(a):
 
 def _gh_token(a):
     import getpass
-    return a.token or os.environ.get("CCM_GH_TOKEN") or getpass.getpass("GitHub token (hidden): ").strip()
+    if a.token_stdin:
+        return sys.stdin.read().strip()
+    if a.token or os.environ.get("CCM_GH_TOKEN"):
+        return (a.token or os.environ["CCM_GH_TOKEN"]).strip()
+    if not sys.stdin.isatty():
+        raise SystemExit("no token: pipe it in with --token-stdin (e.g. `pbpaste | ccm_server.py github-init "
+                         "--repo X --token-stdin`) or set CCM_GH_TOKEN")
+    return getpass.getpass("GitHub token (hidden): ").strip()
 
 
 def cmd_github_init(a):
@@ -476,6 +483,7 @@ def main(argv=None):
     p = sub.add_parser("github-init", help="set up the private GitHub data repo transport; prints the join code")
     p.add_argument("--repo", required=True, help="owner/name of the PRIVATE data repo")
     p.add_argument("--token", help="fine-grained token (or env CCM_GH_TOKEN, or prompt)")
+    p.add_argument("--token-stdin", action="store_true", help="read the token from stdin (e.g. pbpaste |)")
     p.add_argument("--passphrase", help="encryption passphrase (default: generated)")
     sub.add_parser("join-code", help="print the join code again")
     p = sub.add_parser("request", help="ask all (or some) devices to upload fresh data now")
